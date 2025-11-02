@@ -70,6 +70,20 @@ await prisma.user.findMany();
 
 If you prefer to fall back automatically when the optimized bundle is unavailable (for example, in slim deployments where the extra bundle isn't shipped), wrap the `require` in a try/catch and fall back to the base entry point. The core API and configuration shape is identical between the two builds, so switching is a one-line change.
 
+Runtime Configuration
+---------------------
+
+The adapter looks at a few environment variables to control pooling behaviour:
+
+| Env var | Default | What it does |
+| --- | --- | --- |
+| `PRISMA_BUN_ADAPTER_DISABLE_POOL` | `false` | When `true`, disables connection pooling entirely and creates a fresh Bun connection for every query. |
+| `PRISMA_BUN_ADAPTER_DISABLE_POOL_FOR_TX` | `true` | Disables pooling for Prisma `$transaction` calls only. While true, each interactive transaction gets a dedicated short-lived connection. |
+
+> Build selection (base vs optimised) is done by import path, not by an environment variable. If you want to gate which build you load at runtime, do so in your host application code (e.g. `if (process.env.MY_FLAG) require("@abcx3/prisma-bun-adapter/optimized") else require("@abcx3/prisma-bun-adapter")`).
+
+> **Heads up:** Bun’s pooled connections can currently misbehave inside nested Prisma transactions (connections are reused too early, leading to “Transaction already closed” errors). Until that bug is fully resolved, the optimised adapter defaults `PRISMA_BUN_ADAPTER_DISABLE_POOL_FOR_TX` to `true`; leave it in place unless you have a local fix, or use the base adapter if preferred.
+
 
 
 Import Matrix

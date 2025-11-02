@@ -1,6 +1,7 @@
 import {
   ColumnType,
   ColumnTypeEnum,
+  DriverAdapterError,
   IsolationLevel,
   SqlDriverAdapter,
   SqlQuery,
@@ -69,6 +70,8 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     reject: (err: Error) => void;
   }> = [];
   private maxConnections: number;
+  private poolingDisabled: boolean;
+  private disablePoolForTransactions: boolean;
   // Track in-use connections to avoid double-release
   private inUseConnections: Set<BunSqlConnection> = new Set();
   // Pre-warm threshold: start creating connections when we hit this usage
@@ -82,15 +85,29 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
 
   constructor(connectionString: string, maxConnections: number = 20) {
     this.connectionString = connectionString;
-    this.maxConnections = maxConnections;
-    // Pre-warm when we hit 70% capacity
-    this.preWarmThreshold = Math.floor(maxConnections * 0.7);
-    // For high connection counts, keep at least 10% of connections warm
-    // For lower counts, keep at least 2 connections warm
-    this.minPoolSize = Math.max(2, Math.floor(maxConnections * 0.1));
+    this.poolingDisabled = (process.env.PRISMA_BUN_ADAPTER_DISABLE_POOL || "false") === "true";
+    this.disablePoolForTransactions =
+      (process.env.PRISMA_BUN_ADAPTER_DISABLE_POOL_FOR_TX || "true") === "true" || this.poolingDisabled;
+    this.maxConnections = this.poolingDisabled ? 1 : maxConnections;
+
+    if (this.poolingDisabled) {
+      this.preWarmThreshold = 0;
+      this.minPoolSize = 0;
+    } else {
+      // Pre-warm when we hit 70% capacity
+      this.preWarmThreshold = Math.floor(this.maxConnections * 0.7);
+      // For high connection counts, keep at least 10% of connections warm
+      // For lower counts, keep at least 2 connections warm
+      this.minPoolSize = Math.max(2, Math.floor(this.maxConnections * 0.1));
+    }
   }
 
   private async getConnection(): Promise<BunSqlConnection> {
+    if (this.poolingDisabled) {
+      const connection = await this.createConnection();
+      this.inUseConnections.add(connection);
+      return connection;
+    }
     // Fast path: try to get an available connection (LIFO is faster than round-robin)
     if (this.availableConnections.length > 0) {
       const connection = this.availableConnections.pop()!;
@@ -143,6 +160,9 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
   }
 
   private async preWarmConnection(): Promise<void> {
+    if (this.poolingDisabled) {
+      return;
+    }
     // Only pre-warm if we're not at max, have no waiters, and not already creating
     if (this.connections.length < this.maxConnections && 
         this.waitQueue.length === 0 &&
@@ -152,7 +172,7 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       try {
         const connection = await this.createConnection();
         this.connections.push(connection);
-        this.availableConnections.push(connection);
+      this.availableConnections.push(connection);
         
         // Continue pre-warming until we hit minimum pool size
         if (this.availableConnections.length < this.minPoolSize &&
@@ -196,9 +216,32 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
         this.connections.length < this.maxConnections &&
         this.pendingConnections === 0 &&
         this.waitQueue.length === 0) {
+      if (this.poolingDisabled) {
+        return;
+      }
       this.preWarmConnection().catch(() => {
         // Ignore
       });
+    }
+  }
+
+  private closeConnection(connection: BunSqlConnection): void {
+    try {
+      const maybeEnd = connection.end?.();
+      if (maybeEnd && typeof (maybeEnd as any).then === "function") {
+        maybeEnd.catch(() => {});
+        return;
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      const maybeClose = connection.close?.();
+      if (maybeClose && typeof (maybeClose as any).then === "function") {
+        maybeClose.catch(() => {});
+      }
+    } catch {
+      // ignore
     }
   }
 
@@ -430,7 +473,8 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       for (const statement of statements) {
         if (statement.trim()) {
           const strings = this.createTemplateStrings([statement.trim()]);
-          await connection(strings);
+          const result = await connection(strings);
+          this.ensureSuccessfulResult(result, statement.trim());
         }
       }
     } finally {
@@ -481,7 +525,7 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
 
     } catch (error) {
       console.error("Error in queryRaw:", error);
-      throw new Error(error instanceof Error ? error.message : String(error));
+      this.throwDriverError(error, query.sql, { query, stage: "queryRaw" });
     } finally {
       this.releaseConnection(connection);
     }
@@ -497,13 +541,25 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       );
       return result.affectedRows || result.count || 0;
     } catch (error) {
-      throw new Error(error instanceof Error ? error.message : String(error));
+      this.throwDriverError(error, query.sql, { query, stage: "executeRaw" });
     } finally {
       this.releaseConnection(connection);
     }
   }
 
-  private executeQueryOptimized(
+  private ensureSuccessfulResult(result: BunSqlResult, sql: string): BunSqlResult {
+    const payload = result as any;
+    const error = payload?.error ?? payload?.cause;
+    if (error) {
+      this.throwDriverError(error, sql, payload);
+    }
+    if (payload?.success === false) {
+      this.throwDriverError(payload?.error ?? payload, sql, payload);
+    }
+    return result;
+  }
+
+  private async executeQueryOptimized(
     connection: BunSqlConnection,
     sql: string,
     args: any[],
@@ -511,7 +567,8 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     // Fast path for queries without parameters
     if (args.length === 0) {
       const strings = this.createTemplateStrings([sql]);
-      return connection(strings);
+      const result = await connection(strings);
+      return this.ensureSuccessfulResult(result, sql);
     }
 
     const cached = this.getOrCreateTemplate(sql, args.length);
@@ -520,7 +577,8 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
         ? cached.argOrder.map((i) => args[i])
         : args;
       const coerced = this.coerceArgsForPostgres(expanded);
-      return connection(cached.strings, ...coerced);
+      const result = await connection(cached.strings, ...coerced);
+      return this.ensureSuccessfulResult(result, sql);
     }
 
     // Fallback: Query has args but no recognized placeholders
@@ -528,7 +586,8 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     // We still need to coerce arrays for Postgres compatibility
     const coerced = this.coerceArgsForPostgres(args);
     const strings = this.createTemplateStrings([sql]);
-    return connection(strings, ...coerced);
+    const result = await connection(strings, ...coerced);
+    return this.ensureSuccessfulResult(result, sql);
   }
 
   private createTemplateStrings(parts: string[]): TemplateStringsArray {
@@ -839,13 +898,19 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
   async startTransaction(
     isolationLevel?: IsolationLevel,
   ): Promise<Transaction> {
-    const connection = await this.getConnection();
+    const connection = this.disablePoolForTransactions
+      ? await this.createConnection()
+      : await this.getConnection();
     let reserved: BunReservedSqlConnection;
 
     try {
       reserved = await connection.reserve();
     } catch (err) {
-      this.releaseConnection(connection);
+      if (this.disablePoolForTransactions) {
+        this.closeConnection(connection);
+      } else {
+        this.releaseConnection(connection);
+      }
       throw err;
     }
 
@@ -894,7 +959,11 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
         }
       } finally {
         await releaseReserved();
-        this.releaseConnection(connection);
+        if (this.disablePoolForTransactions) {
+          this.closeConnection(connection);
+        } else {
+          this.releaseConnection(connection);
+        }
       }
     };
 
@@ -910,7 +979,11 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       }
     } catch (err) {
       await releaseReserved();
-      this.releaseConnection(connection);
+      if (this.disablePoolForTransactions) {
+        this.closeConnection(connection);
+      } else {
+        this.releaseConnection(connection);
+      }
       throw err;
     }
 
@@ -926,7 +999,7 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
         return await this.executeTransactionQueryOptimized(txRunner, sql, args);
       } catch (err) {
         aborted = true;
-        throw err;
+        this.throwDriverError(err, sql, { args, transaction: true });
       }
     };
 
@@ -984,14 +1057,15 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     };
   }
 
-  private executeTransactionQueryOptimized(
+  private async executeTransactionQueryOptimized(
     tx: BunSqlTransaction,
     sql: string,
     args: any[],
   ): Promise<BunSqlResult> {
     if (args.length === 0) {
       const strings = this.createTemplateStrings([sql]);
-      return tx(strings);
+      const result = await tx(strings);
+      return this.ensureSuccessfulResult(result, sql);
     }
 
     const cached = this.getOrCreateTemplate(sql, args.length);
@@ -1000,14 +1074,208 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
         ? cached.argOrder.map((i) => args[i])
         : args;
       const coerced = this.coerceArgsForPostgres(expanded, sql);
-      return tx(cached.strings, ...coerced);
+      const result = await tx(cached.strings, ...coerced);
+      return this.ensureSuccessfulResult(result, sql);
     }
 
     // Fallback: Transaction query has args but no recognized placeholders
     // Apply array coercion for Postgres compatibility
     const coerced = this.coerceArgsForPostgres(args, sql);
     const strings = this.createTemplateStrings([sql]);
-    return tx(strings, ...coerced);
+    const result = await tx(strings, ...coerced);
+    return this.ensureSuccessfulResult(result, sql);
+  }
+
+  private throwDriverError(rawError: unknown, sql: string, payload?: unknown): never {
+    if (rawError instanceof DriverAdapterError) {
+      throw rawError;
+    }
+
+    if (rawError instanceof Error) {
+      const mapped = this.mapPostgresError(rawError);
+      (mapped as any).context = { sql, payload, original: rawError };
+      throw new DriverAdapterError(mapped);
+    }
+
+    if (rawError && typeof rawError === "object") {
+      const mapped = this.mapPostgresError(rawError);
+      (mapped as any).context = { sql, payload, original: rawError };
+      throw new DriverAdapterError(mapped);
+    }
+
+    const message =
+      typeof rawError === "string" ? rawError : "Bun SQL query failed";
+    const mapped: any = {
+      kind: "postgres",
+      code: "UNKNOWN",
+      severity: "ERROR",
+      message,
+      detail: undefined,
+      column: undefined,
+      hint: undefined,
+      originalMessage: message,
+    };
+    mapped.context = { sql, payload, original: rawError };
+    throw new DriverAdapterError(mapped);
+  }
+
+  private mapPostgresError(error: any) {
+    const message =
+      typeof error?.message === "string" ? error.message : "Postgres error";
+    const severity =
+      typeof error?.severity === "string" ? error.severity : "ERROR";
+    const detail = typeof error?.detail === "string" ? error.detail : undefined;
+    const column =
+      typeof error?.column === "string"
+        ? error.column
+        : this.extractIdentifier(message);
+    const hint = typeof error?.hint === "string" ? error.hint : undefined;
+    const sqlState =
+      typeof error?.errno === "string"
+        ? error.errno
+        : typeof error?.code === "string" && /^[0-9A-Z]{5}$/.test(error.code)
+          ? error.code
+          : undefined;
+
+    if (!sqlState && message === "Transaction is already closed") {
+      return {
+        kind: "TransactionAlreadyClosed" as const,
+        cause: message,
+        originalMessage: message,
+      };
+    }
+
+    const base: any = {
+      originalCode:
+        sqlState ??
+        (typeof error?.code === "string" ? error.code : undefined),
+      originalMessage: message,
+    };
+
+    const fields = this.extractConstraintFields(detail);
+
+    switch (sqlState) {
+      case "23505":
+        return {
+          ...base,
+          kind: "UniqueConstraintViolation",
+          constraint: fields ? { fields } : undefined,
+        };
+      case "23502":
+        return {
+          ...base,
+          kind: "NullConstraintViolation",
+          constraint: fields ? { fields } : undefined,
+        };
+      case "23503":
+        return {
+          ...base,
+          kind: "ForeignKeyConstraintViolation",
+          constraint: fields ? { fields } : undefined,
+        };
+      case "3D000":
+        return {
+          ...base,
+          kind: "DatabaseDoesNotExist",
+          db: typeof error?.database === "string" ? error.database : undefined,
+        };
+      case "42P01":
+        return {
+          ...base,
+          kind: "TableDoesNotExist",
+          table:
+            typeof error?.table === "string"
+              ? error.table
+              : this.extractIdentifier(message),
+        };
+      case "42703":
+        return {
+          ...base,
+          kind: "ColumnNotFound",
+          column,
+        };
+      case "53300":
+        return {
+          ...base,
+          kind: "TooManyConnections",
+          cause: message,
+        };
+      case "25P02":
+      case "2F000":
+      case "57014":
+        return {
+          ...base,
+          kind: "TransactionAlreadyClosed",
+          cause: message,
+        };
+      case "40001":
+      case "40P01":
+        return {
+          ...base,
+          kind: "TransactionWriteConflict",
+        };
+      case "08003":
+      case "08006":
+      case "57P01":
+        return {
+          ...base,
+          kind: "ConnectionClosed",
+        };
+      case "28P01":
+      case "28000":
+        return {
+          ...base,
+          kind: "AuthenticationFailed",
+          user: typeof error?.user === "string" ? error.user : undefined,
+        };
+      case "22001":
+        return {
+          ...base,
+          kind: "LengthMismatch",
+          column,
+        };
+      case "22003":
+        return {
+          ...base,
+          kind: "ValueOutOfRange",
+          cause: message,
+        };
+      default:
+        return {
+          ...base,
+          kind: "postgres",
+          code:
+            sqlState ??
+            (typeof error?.code === "string" ? error.code : "UNKNOWN"),
+          severity,
+          message,
+          detail,
+          column,
+          hint,
+        };
+    }
+  }
+
+  private extractConstraintFields(detail?: string): string[] | undefined {
+    if (typeof detail !== "string") {
+      return undefined;
+    }
+    const match = detail.match(/Key \\(([^)]+)\\)/);
+    if (!match) {
+      return undefined;
+    }
+    return match[1]
+      .split(",")
+      .map((field) => field.trim())
+      .filter(Boolean);
+  }
+
+  private extractIdentifier(message?: string): string | undefined {
+    if (typeof message !== "string") {
+      return undefined;
+    }
+    const match = message.match(/\"([^\"]+)\"/);
+    return match?.[1];
   }
 
   private inferColumnTypeFast(value: unknown): ColumnType {

@@ -1,5 +1,12 @@
 Changelog
 =========
+1.1.11 - 2025-11-02
+-------------------
+
+- Optimised Postgres adapter now bypasses the connection pool for Prisma `$transaction` calls by default (`PRISMA_BUN_ADAPTER_DISABLE_POOL_FOR_TX=true`) to avoid the pooled “transaction already closed” bug.
+- Added explicit environment flag handling for disabling pooling entirely (`PRISMA_BUN_ADAPTER_DISABLE_POOL`) and documented all switches in the README.
+- Improved error propagation for transactional queries so Prisma receives the original `P20xx` codes instead of generic adapter errors.
+
 1.1.10 - 2025-11-01
 -------------------
 
