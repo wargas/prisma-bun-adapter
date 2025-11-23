@@ -1,6 +1,6 @@
 {
-  "name": "@abcx3/prisma-bun-adapter",
-  "version": "1.1.11",
+  "name": "prisma-adapter-bun",
+  "version": "0.0.1",
   "description": "Prisma adapters for Bun's native SQL clients (PostgreSQL, MySQL, SQLite)",
   "type": "module",
   "main": "dist/index.js",
@@ -43,7 +43,7 @@
     "test:panda": "bun test-app/panda-organization-role.ts",
     "demo:sqlite": "bun run test-app/sqlite-comparison-demo.ts",
     "demo:quick": "bun test-app/quick-comparison-demo.ts",
-    "publish": "bun run build && npm publish"
+    "publish": "bun run build && npm publish --access public"
   },
   "keywords": [
     "prisma",
@@ -57,12 +57,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/FredrikBorgstrom/prisma-bun-adapter.git"
+    "url": "git+https://github.com/wargas/prisma-bun-adapter.git"
   },
   "bugs": {
-    "url": "https://github.com/FredrikBorgstrom/prisma-bun-adapter/issues"
+    "url": "https://github.com/wargas/prisma-bun-adapter/issues"
   },
-  "homepage": "https://github.com/FredrikBorgstrom/prisma-bun-adapter#readme",
+  "homepage": "https://github.com/wargas/prisma-bun-adapter#readme",
   "peerDependencies": {
     "@prisma/client": "^6.0.0"
   },

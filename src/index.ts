@@ -364,6 +364,11 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
     try {
       const parsed = new URL(raw);
       const scheme = parsed.protocol.replace(":", "");
+
+      if (scheme == 'file') {
+        return raw;
+      }
+
       if (
         [
           "postgres",
@@ -1217,3 +1222,4 @@ export default BunPostgresAdapter;
 export {
   BunPostgresAdapter as BunPostgresOptimized, BunPostgresAdapter as OptimizedBunPostgresAdapter, OptimizedBunPostgresDriverAdapter
 } from "./optimized-index.js";
+
